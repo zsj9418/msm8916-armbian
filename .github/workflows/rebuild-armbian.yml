@@ -11,7 +11,7 @@ on:
       armbian_board:
         description: "选择设备"
         required: true
-        default: "ufi003"
+        default: "ufi001"
         type: choice
         options:
           - ufi001c
