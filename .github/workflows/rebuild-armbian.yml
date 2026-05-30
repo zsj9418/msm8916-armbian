@@ -1,97 +1,427 @@
-#==========================================================================
-# Description: Build Armbian
-# Copyright (C) 2023 https://github.com/windbell-project/msm8916-armbian
-#==========================================================================
-
-name: Rebuild armbian
+name: Armbian MSM8916 Rebuild Workflows
 
 on:
+  push:
+    branches: [ "main" ]
   workflow_dispatch:
-    inputs:
-      armbian_board:
-        description: "选择设备"
-        required: true
-        default: "ufi003"
-        type: choice
-        options:
-          - ufi001c
-          - ufi003
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  get-versions:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: "${{ steps.set-matrix.outputs.matrix }}"
     steps:
-      - name: 安装依赖
+      - name: Get Armbian Versions
+        id: set-matrix
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
-          sudo apt update -y
-          sudo apt-get install -y zip flex bison libncurses-dev gawk  libiberty-dev autoconf kmod bc build-essential gcc libc6 curl libstdc++6 git wget libssl-dev cpio p7zip-full img2simg qemu-user-static
-          sudo apt clean
-      - name: 下载源码
+          echo "Fetching available Armbian versions..."
+          REPO="ophub/amlogic-s9xxx-armbian"
+          API_URL="https://api.github.com/repos/${REPO}/releases?per_page=30"
+          
+          RESPONSE=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
+          
+          if echo "$RESPONSE" | jq -e '. | type == "array"' >/dev/null 2>&1; then
+            echo "✅ Valid JSON response received"
+          else
+            echo "❌ Error: GitHub API returned invalid JSON:"
+            echo "$RESPONSE" | head -n 10 || true
+            exit 1
+          fi
+          
+          echo "$RESPONSE" > response.json
+          
+          VERSIONS=$(echo "$RESPONSE" | jq -r '.[] | select(.tag_name | contains("arm64")) | .tag_name' | head -n 10)
+          
+          if [ -z "$VERSIONS" ]; then
+            echo "❌ Error: Cannot extract any versions containing 'arm64'."
+            exit 1
+          fi
+          
+          VERSION_CODES=""
+          while IFS= read -r tag; do
+            if [[ $tag =~ ^Armbian_([a-zA-Z0-9]+)_arm64 ]]; then
+              version_code="${BASH_REMATCH[1]}"
+              if [[ -n "$version_code" && ! "$VERSION_CODES" =~ (^|[[:space:]])$version_code($|[[:space:]]) ]]; then
+                VERSION_CODES="$VERSION_CODES $version_code"
+              fi
+            fi
+          done <<< "$VERSIONS"
+          
+          VERSION_CODES=$(echo $VERSION_CODES | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          
+          if [ -z "$VERSION_CODES" ]; then
+            echo "❌ Error: Cannot extract any valid version codes."
+            exit 1
+          fi
+          
+          JSON_ARRAY="["
+          first=true
+          for ver in $VERSION_CODES; do
+            if [ "$first" = true ]; then
+              JSON_ARRAY="${JSON_ARRAY}\"${ver}\""
+              first=false
+            else
+              JSON_ARRAY="${JSON_ARRAY},\"${ver}\""
+            fi
+          done
+          JSON_ARRAY="${JSON_ARRAY}]"
+          
+          echo "Generated Matrix: ${JSON_ARRAY}"
+          echo "matrix=${JSON_ARRAY}" >> $GITHUB_OUTPUT
+
+  build:
+    needs: get-versions
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: "${{ fromJson(needs.get-versions.outputs.matrix) }}"
+      fail-fast: false
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
         run: |
-          git clone https://github.com/windbell-project/msm8916-armbian
-      - name: 下载镜像
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget unzip rsync bc bison flex build-essential \
+            libssl-dev libelf-dev libdw-dev libncurses-dev pahole cpio \
+            fakeroot dpkg-dev debhelper devscripts equivs kmod xz-utils \
+            zstd python3 e2fsprogs fdisk util-linux android-sdk-libsparse-utils \
+            qemu-user-static jq
+          
+          # 1. 如果系统里已经通过 apt 装了那个带 bug 的 mkbootimg，直接强行干掉它和它的残留
+          sudo apt-get purge -y mkbootimg || true
+          sudo rm -f /usr/bin/mkbootimg /usr/local/bin/mkbootimg
+          
+          # 2. 精准下载你截图里的那个无 gki 依赖的 AOSP 历史版本 (9c46d9ee)
+          sudo wget -q "https://android.googlesource.com/platform/system/tools/mkbootimg/+/9c46d9eee9a1b469ccf46db917ac78fc9f0fdaf1/mkbootimg.py?format=TEXT" -O /tmp/mkbootimg.b64
+          base64 -d /tmp/mkbootimg.b64 > /tmp/mkbootimg
+          sudo chmod +x /tmp/mkbootimg
+          
+          # 3. 把它移到全局可执行路径
+          sudo mv /tmp/mkbootimg /usr/local/bin/mkbootimg
+
+      - name: Download Original Armbian Image
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
-          pushd msm8916-armbian
-          ./download
-          popd
-      - name: 打包 Armbian
-        id: repack
+          REPO="ophub/amlogic-s9xxx-armbian"
+          API_URL="https://api.github.com/repos/${REPO}/releases"
+          SELECTED_VER="${{ matrix.version }}"
+          
+          RELEASES_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
+          FULL_TAG=$(echo "$RELEASES_JSON" | jq -r ".[] | select(.tag_name | contains(\"${SELECTED_VER}\") and contains(\"arm64\")) | .tag_name" | head -n 1)
+          
+          if [ -z "${FULL_TAG}" ] || [ "${FULL_TAG}" = "null" ]; then
+            exit 1
+          fi
+          
+          ASSETS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}/tags/${FULL_TAG}")
+          TRUNK_FILE=$(echo "$ASSETS_JSON" | jq -r '.assets[] | select(.name | test("trunk.*\\.(img|gz|xz|zip)$")) | .name' | head -n 1)
+          
+          if [ -z "${TRUNK_FILE}" ] || [ "${TRUNK_FILE}" = "null" ]; then
+            TRUNK_FILE=$(echo "$ASSETS_JSON" | jq -r '.assets[] | select(.name | test("\\.(img|gz|xz|zip)$")) | .name' | head -n 1)
+          fi
+          
+          DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${FULL_TAG}/${TRUNK_FILE}"
+          wget -q --show-progress -c "${DOWNLOAD_URL}" -O "${TRUNK_FILE}"
+          
+          if [[ "$TRUNK_FILE" == *.gz ]]; then
+              gunzip -k "${TRUNK_FILE}" 2>/dev/null || gunzip "${TRUNK_FILE}"
+              IMGFILE="${TRUNK_FILE%.gz}"
+          elif [[ "$TRUNK_FILE" == *.xz ]]; then
+              xz -d "${TRUNK_FILE}"
+              IMGFILE="${TRUNK_FILE%.xz}"
+          else
+              IMGFILE="$TRUNK_FILE"
+          fi
+          
+          mv "${IMGFILE}" armbian.img
+
+      - name: Download Latest MSM8916 Kernel Components
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
-          pushd msm8916-armbian
-          sudo mkdir armbian
-          sudo mkdir armbian-msm8916
-          sudo mkdir temp
-          sudo dd if=/dev/zero of=temp.img bs=1M count=1536
-          sudo dd if=/dev/zero of=armbian-msm8916.img bs=1M count=1234
-          sudo mkfs.btrfs armbian-msm8916.img
-          sudo mkfs.btrfs temp.img
-          sudo mount -o compress=zstd:15 temp.img temp
-          sudo mount -o compress=zstd:15 armbian-msm8916.img armbian-msm8916
-          sudo losetup -P /dev/loop404 armbian.img
-          sudo mount /dev/loop404p1 armbian
-          sudo cp -rfp armbian/* temp
-          sudo cp common-file/* temp/tmp
-          sudo cp kernel/*.deb temp/tmp
-          sudo cp modem/firmware-${{ inputs.armbian_board }}.deb temp/tmp
-          sudo mount --bind /proc temp/proc
-          sudo mount --bind /dev temp/dev
-          sudo mount --bind /dev/pts temp/dev/pts
-          sudo mount --bind /sys temp/sys
-          sudo chroot temp /tmp/chroot.sh
-          sudo rm temp/tmp/*
-          sudo umount temp/proc
-          sudo umount temp/dev/pts
-          sudo umount temp/dev
-          sudo umount temp/sys
-          sudo cp -rfp temp/* armbian-msm8916
-          sudo umount temp
-          sudo umount armbian-msm8916
-          sudo umount armbian
-          sudo losetup -d /dev/loop404
-          sudo img2simg armbian-msm8916.img rootfs.img
-          sudo rm temp.img
-          sudo rm -rf armbian
-          sudo rm -rf armbian-msm8916
-          sudo rm -rf temp
-          popd
-          echo "build_tag=Armbian_noble_save_$(date +"%Y.%m")" >> ${GITHUB_OUTPUT}
-      - name: 上传 Armbian 镜像至 Release
-        uses: ncipollo/release-action@main
+          mkdir -p kernel_debs
+          cd kernel_debs
+          API_URL="https://api.github.com/repos/${{ github.repository }}/releases/tags/kernel_stable"
+          KERNEL_ASSETS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
+          
+          KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r '.assets[] | select(.name | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz$")) | .browser_download_url' | head -n 1)
+          
+          wget -q "${KERNEL_TAR_URL}" -O kernel-package.tar.gz
+          tar -xzvf kernel-package.tar.gz
+          
+          # ======== 🛠️ 修复后的安全重命名逻辑 ========
+          # 使用 find 查找时排除掉已经是目标名称的文件，防止同名冲突
+          IMAGE_DEB=$(find . -name "*image*.deb" ! -name "linux-image.deb" | head -n 1)
+          [ -n "$IMAGE_DEB" ] && mv "$IMAGE_DEB" linux-image.deb || true
+          
+          HEADERS_DEB=$(find . -name "*headers*.deb" ! -name "linux-headers.deb" | head -n 1)
+          [ -n "$HEADERS_DEB" ] && mv "$HEADERS_DEB" linux-headers.deb || true
+          
+          IMG_GZ=$(find . -name "Image.gz" | head -n 1)
+          # 如果解压出来的叫别的名字（比如 Image.gz-6.x），则重命名
+          if [ -z "$IMG_GZ" ]; then
+             ALT_IMG_GZ=$(find . -name "*Image*.gz" | head -n 1)
+             [ -n "$ALT_IMG_GZ" ] && mv "$ALT_IMG_GZ" Image.gz
+          fi
+          
+          DTB_FILE=$(find . -name "*ufi001c*.dtb" ! -name "msm8916-thwc-ufi001c.dtb" | head -n 1)
+          [ -n "$DTB_FILE" ] && mv "$DTB_FILE" msm8916-thwc-ufi001c.dtb || true
+          
+          # 清理掉下载的压缩包，保持目录干净
+          rm -f kernel-package.tar.gz
+          cd ..
+
+      - name: Copy Firmware Packages from Local Modem Folder
+        run: |
+          mkdir -p firmware_debs
+          cp modem/firmware-ufi001c.deb firmware_debs/
+          cp modem/firmware-ufi003.deb firmware_debs/
+
+      - name: Rebuild Common Rootfs and Diversify to UFI001C and UFI003
+        run: |
+          sudo -E bash -c '
+          set -euo pipefail
+          
+          SCRIPT_DIR="$(pwd)"
+          ORIG_DIR="${SCRIPT_DIR}/original_image"
+          TEMP_DIR="${SCRIPT_DIR}/temp_common"
+          TEMP_IMG="${SCRIPT_DIR}/temp_common.img"
+          ORIGINAL_IMG="${SCRIPT_DIR}/armbian.img"
+          
+          mkdir -p "${ORIG_DIR}" "${TEMP_DIR}"
+          
+          # 计算所需大小
+          LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
+          sleep 1
+          partprobe "${LOOP_DEV}" 2>/dev/null || true
+          LOOP_PART="${LOOP_DEV}p1" && [[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
+          
+          mount "${LOOP_PART}" "${ORIG_DIR}"
+          bytes=$(du -sb "${ORIG_DIR}" 2>/dev/null | cut -f1)
+          ORIG_SIZE=$(( (bytes / 1024 / 1024) + (bytes / 1024 / 1024 / 5) + 64 ))
+          EXTRA_SIZE=512
+          TEMP_SIZE=$((ORIG_SIZE + EXTRA_SIZE))
+          OUTPUT_SIZE=$((ORIG_SIZE + EXTRA_SIZE + 128))
+          
+          umount "${ORIG_DIR}"
+          losetup -d "${LOOP_DEV}"
+          
+          # 创建公共的临时镜像
+          dd if=/dev/zero of="${TEMP_IMG}" bs=1M count=${TEMP_SIZE} status=none
+          mkfs.btrfs -f "${TEMP_IMG}"
+          
+          LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
+          partprobe "${LOOP_DEV}" 2>/dev/null || true
+          LOOP_PART="${LOOP_DEV}p1" && [[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
+          
+          mount -t btrfs -o compress=zstd:15 "${TEMP_IMG}" "${TEMP_DIR}"
+          mount "${LOOP_PART}" "${ORIG_DIR}"
+          
+          # 复制原始系统文件
+          cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
+          
+          mkdir -p "${TEMP_DIR}/tmp/kernel"
+          cp ${SCRIPT_DIR}/kernel_debs/*.deb "${TEMP_DIR}/tmp/kernel/"
+          if [ -d "${SCRIPT_DIR}/common-file" ]; then
+            cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/"
+          fi
+          
+          chmod 1777 "${TEMP_DIR}/tmp"
+          rm -f "${TEMP_DIR}/etc/resolv.conf"
+          cat > "${TEMP_DIR}/etc/resolv.conf" << "EOF"
+          nameserver 223.5.5.5
+          nameserver 119.29.29.29
+          EOF
+          
+          mount --bind /proc "${TEMP_DIR}/proc"
+          mount --bind /dev "${TEMP_DIR}/dev"
+          mount --bind /dev/pts "${TEMP_DIR}/dev/pts"
+          mount --bind /sys "${TEMP_DIR}/sys"
+          
+          # ==================== 公共基础 Chroot 脚本 ====================
+          cat > "${TEMP_DIR}/tmp/chroot_common.sh" << "EOF"
+          #!/bin/bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export LANG=zh_CN.UTF-8
+          export LC_ALL=zh_CN.UTF-8
+          
+          echo "🔧 配置 Apt 软件源..."
+          cat > /etc/apt/sources.list << "EOM"
+          deb http://mirrors.aliyun.com/debian trixie main contrib non-free non-free-firmware
+          deb http://mirrors.aliyun.com/debian trixie-updates main contrib non-free non-free-firmware
+          deb http://mirrors.aliyun.com/debian-security trixie-security main contrib non-free non-free-firmware
+          EOM
+
+          apt-get update || true
+          
+          echo "🗑️ 移除冲突的内核包..."
+          pkgs=$(dpkg -l 2>/dev/null | grep -E "meson|linux-image" | awk "{print \$2}" || true)
+          if [[ -n "${pkgs}" ]]; then echo "${pkgs}" | xargs -r dpkg -P; fi
+          rm -rf /boot/*
+          
+          echo "💾 安装公共内核依赖包..."
+          dpkg -i /tmp/kernel/linux-image.deb /tmp/kernel/linux-headers.deb || apt-get --fix-broken install -y
+          
+          echo "📥 安装基础环境组件..."
+          apt-get install -y --no-install-recommends coreutils network-manager modemmanager bc bsdmainutils gawk libqmi-utils iptables-persistent dnsmasq-base locales
+          
+          echo "🇨🇳 设置环境与定制配置..."
+          sed -i "s/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/" /etc/locale.gen || true
+          sed -i "s/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/" /etc/locale.gen || true
+          locale-gen
+          update-locale --reset LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 LANGUAGE=zh_CN:zh
+          
+          echo "LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0" > /etc/fstab
+          if [[ -f /etc/rc.local ]]; then
+              sed -i "13i\nmcli c u USB" /etc/rc.local || true
+              sed -i "1s/-e//" /etc/rc.local
+          fi
+          if [[ -f /usr/lib/systemd/system/rc-local.service ]]; then sed -i "s/forking/idle/g" /usr/lib/systemd/system/rc-local.service; fi
+          if [[ -f /etc/armbian-release ]]; then sed -i "s/'\''Odroid N2'\''/MSM8916/g" /etc/armbian-release; fi
+          if [[ -f /etc/default/armbian-zram-config ]]; then
+              sed -i "s/# ZRAM_PERCENTAGE=50/ZRAM_PERCENTAGE=300/g" /etc/default/armbian-zram-config
+              sed -i "s/# MEM_LIMIT_PERCENTAGE=50/MEM_LIMIT_PERCENTAGE=300/g" /etc/default/armbian-zram-config
+          fi
+          rm -f /etc/localtime
+          ln -sf /usr/share/zoneinfo/Asia/Chongqing /etc/localtime
+          EOF
+          # =================================================================
+
+          chmod +x "${TEMP_DIR}/tmp/chroot_common.sh"
+          chroot "${TEMP_DIR}" /tmp/chroot_common.sh
+          
+          # 提取公用生成的 initrd
+          INITRD_PATH=$(ls -1 "${TEMP_DIR}/boot"/initrd.img-* | head -n 1 || echo "")
+          if [ -n "${INITRD_PATH}" ]; then
+            cp "${INITRD_PATH}" "${SCRIPT_DIR}/initrd_ufi001c.img"
+            cp "${INITRD_PATH}" "${SCRIPT_DIR}/initrd_ufi003.img"
+          else
+            echo "ERROR: initrd.img missing!" && exit 1
+          fi
+          
+          umount "${TEMP_DIR}/proc" "${TEMP_DIR}/dev/pts" "${TEMP_DIR}/dev" "${TEMP_DIR}/sys"
+          umount "${ORIG_DIR}"
+          losetup -d "${LOOP_DEV}"
+          
+          # ------------------ 分支处理 1: UFI001C ------------------
+          echo "🌿 正在为 UFI001C 装配固件包..."
+          OUTPUT_IMG_001C="${SCRIPT_DIR}/armbian-msm8916-ufi001c.img"
+          BUILD_DIR_001C="${SCRIPT_DIR}/build_ufi001c"
+          mkdir -p "${BUILD_DIR_001C}"
+          
+          dd if=/dev/zero of="${OUTPUT_IMG_001C}" bs=1M count=${OUTPUT_SIZE} status=none
+          mkfs.btrfs -f "${OUTPUT_IMG_001C}"
+          mount -t btrfs -o compress=zstd:15 "${OUTPUT_IMG_001C}" "${BUILD_DIR_001C}"
+          
+          # 克隆公共 rootfs 并打入特定固件
+          cp -a "${TEMP_DIR}/." "${BUILD_DIR_001C}/"
+          cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi001c.deb" "${BUILD_DIR_001C}/tmp/"
+          
+          mount --bind /proc "${BUILD_DIR_001C}/proc"
+          mount --bind /dev "${BUILD_DIR_001C}/dev"
+          mount --bind /sys "${BUILD_DIR_001C}/sys"
+          
+          chroot "${BUILD_DIR_001C}" bash -c "dpkg -i /tmp/firmware-ufi001c.deb || apt-get --fix-broken install -y && rm -rf /var/lib/apt/lists/* && apt-get clean all"
+          
+          umount "${BUILD_DIR_001C}/proc" "${BUILD_DIR_001C}/dev" "${BUILD_DIR_001C}/sys"
+          rm -rf "${BUILD_DIR_001C}/tmp"/*
+          umount "${BUILD_DIR_001C}"
+          img2simg "${OUTPUT_IMG_001C}" "${SCRIPT_DIR}/rootfs_ufi001c.img"
+          
+          # ------------------ 分支处理 2: UFI003 ------------------
+          echo "🌿 正在为 UFI003 装配固件包..."
+          OUTPUT_IMG_003="${SCRIPT_DIR}/armbian-msm8916-ufi003.img"
+          BUILD_DIR_003="${SCRIPT_DIR}/build_ufi003"
+          mkdir -p "${BUILD_DIR_003}"
+          
+          dd if=/dev/zero of="${OUTPUT_IMG_003}" bs=1M count=${OUTPUT_SIZE} status=none
+          mkfs.btrfs -f "${OUTPUT_IMG_003}"
+          mount -t btrfs -o compress=zstd:15 "${OUTPUT_IMG_003}" "${BUILD_DIR_003}"
+          
+          # 克隆公共 rootfs 并打入特定固件
+          cp -a "${TEMP_DIR}/." "${BUILD_DIR_003}/"
+          cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi003.deb" "${BUILD_DIR_003}/tmp/"
+          
+          mount --bind /proc "${BUILD_DIR_003}/proc"
+          mount --bind /dev "${BUILD_DIR_003}/dev"
+          mount --bind /sys "${BUILD_DIR_003}/sys"
+          
+          chroot "${BUILD_DIR_003}" bash -c "dpkg -i /tmp/firmware-ufi003.deb || apt-get --fix-broken install -y && rm -rf /var/lib/apt/lists/* && apt-get clean all"
+          
+          umount "${BUILD_DIR_003}/proc" "${BUILD_DIR_003}/dev" "${BUILD_DIR_003}/sys"
+          rm -rf "${BUILD_DIR_003}/tmp"/*
+          umount "${BUILD_DIR_003}"
+          img2simg "${OUTPUT_IMG_003}" "${SCRIPT_DIR}/rootfs_ufi003.img"
+          
+          # 清理公共临时挂载
+          umount "${TEMP_DIR}"
+          echo "✅ 两个设备的 rootfs 稀疏镜像生成完毕！"
+          '
+
+      - name: Create Unified Boot Image
+        run: |
+          mkdir -p output_dist
+          
+          cat kernel_debs/Image.gz kernel_debs/msm8916-thwc-ufi001c.dtb > unified-kernel-dtb
+          
+          # 使用修复后的独立 mkbootimg 脚本进行打包
+          mkbootimg \
+            --base 0x80000000 \
+            --kernel_offset 0x00080000 \
+            --ramdisk_offset 0x02000000 \
+            --tags_offset 0x01e00000 \
+            --pagesize 2048 \
+            --second_offset 0x00f00000 \
+            --ramdisk initrd_ufi001c.img \
+            --cmdline "earlycon root=/dev/mmcblk0p14 rootwait console=ttyMSM0,115200 no_framebuffer=true rw" \
+            --kernel unified-kernel-dtb \
+            -o output_dist/boot.img
+            
+          echo "✅ Unified boot.img successfully packed!"
+          
+          cp rootfs_ufi001c.img output_dist/rootfs_ufi001c.img
+          cp rootfs_ufi003.img output_dist/rootfs_ufi003.img
+
+      - name: Prepare Workspace Artifacts
+        run: |
+          VERSION_NAME="${{ matrix.version }}"
+          # 👈 核心修复：提前固定时间戳，防止 tar 和 mv 之间产生秒级时差
+          BUILD_TIME=$(date +%Y%m%d_%H%M%S)
+          CURRENT_DATE=$(date +%Y.%m.%d)
+          
+          cd output_dist
+          
+          # 使用固定的 $BUILD_TIME 变量进行打包和移动
+          tar -czvf "Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" boot.img rootfs_ufi001c.img
+          mv "Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" ..
+          
+          tar -czvf "Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" boot.img rootfs_ufi003.img
+          mv "Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" ..
+          cd ..
+          
+          # 将确切的文件名写入环境变量，供下一步 Release 提取
+          echo "UFI001C_ARCHIVE=Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" >> $GITHUB_ENV
+          echo "UFI003_ARCHIVE=Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" >> $GITHUB_ENV
+          echo "TAG_NAME=Armbian_${VERSION_NAME}_${CURRENT_DATE}" >> $GITHUB_ENV
+
+      - name: Upload Output to Release Tag
+        uses: softprops/action-gh-release@v2
         with:
-          artifacts: "msm8916-armbian/rootfs.img,msm8916-armbian/kernel/boot.img"
-          name: ${{ steps.repack.outputs.build_tag }}
-          tag: ${{ steps.repack.outputs.build_tag }}
-          allowUpdates: true
-          removeArtifacts: false
-          replacesArtifacts: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-          body: |
-            ### 以下是 Armbian OS 镜像
-            - 本次固件基带为${{ inputs.armbian_board }}
-            - 系统信息：
-            - 默认用户名：root
-            - 默认密码：1234
-            - 全局配置命令：armbian-config
-            - WiFi名称：4G-UFI
-            - WiFi密码：12345678
-            - 如遇无法开机的情况请使用未超频内核boot-no-overclock.img
+          tag_name: "${{ env.TAG_NAME }}"
+          files: |
+            ${{ env.UFI001C_ARCHIVE }}
+            ${{ env.UFI003_ARCHIVE }}
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
