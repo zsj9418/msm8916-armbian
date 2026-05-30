@@ -1,75 +1,279 @@
 #!/bin/bash
+set -euo pipefail
 
-# 选择构建的设备
-echo "选择构建的设备："
-echo "1. ufi001c"
-echo "2. ufi003"
-read -p "请输入设备型号：" device_type
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly ORIG_DIR="${SCRIPT_DIR}/original_image"
+readonly BUILD_DIR="${SCRIPT_DIR}/build"
+readonly TEMP_DIR="${SCRIPT_DIR}/temp"
+readonly TEMP_IMG="${SCRIPT_DIR}/temp.img"
+readonly OUTPUT_IMG="${SCRIPT_DIR}/armbian-msm8916.img"
+readonly ORIGINAL_IMG="${SCRIPT_DIR}/armbian.img"
+readonly FINAL_IMG="${SCRIPT_DIR}/rootfs.img"
 
-# 设置设备型号
-case $device_type in
-1)
-  device_type="ufi001c"
-  ;;
-2)
-  device_type="ufi003"
-  ;;
-*)
-  echo "输入的设备型号不正确，请重新输入。"
-  exit 1
-  ;;
-esac
+KEEP_TEMP="${KEEP_TEMP:-0}"
+DEVICE=""
+LOOP_DEV=""
 
-# 创建目录
-mkdir -p original_image build temp
+log_info() { echo "🚀 $*"; }
+log_ok()   { echo "✅ $*"; }
+log_warn() { echo "⚠️  $*"; }
+log_err()  { echo "❌ $*" >&2; }
 
-# 创建镜像
-dd if=/dev/zero of=temp.img bs=1M count=1536
-mkfs.btrfs temp.img
-dd if=/dev/zero of=armbian-msm8916.img bs=1M count=1234
-mkfs.btrfs armbian-msm8916.img
+calc_image_size() {
+    local dir="$1"
+    local size_mb
+    if [[ -d "${dir}" ]]; then
+        local bytes=$(du -sb "${dir}" 2>/dev/null | cut -f1)
+        size_mb=$(( (bytes / 1024 / 1024) + (bytes / 1024 / 1024 / 5) + 64 ))
+    else
+        size_mb=1536
+    fi
+    echo "${size_mb}"
+}
 
-# 挂载镜像
-mount -t btrfs -o compress=zstd:15 temp.img temp
-mount -t btrfs -o compress=zstd:15 armbian-msm8916.img build
-losetup -P /dev/loop404 armbian.img
-mount /dev/loop404p1 original_image
+cleanup() {
+    local exit_code=$?
+    log_info "执行清理..."
 
-# 复制文件
-cp -frp original_image/* temp
-cp common-file/* temp/tmp
-cp kernel/*.deb temp/tmp
-cp modem/firmware-$device_type.deb temp/tmp
+    for mp in "${TEMP_DIR}/proc" "${TEMP_DIR}/dev/pts" "${TEMP_DIR}/dev" "${TEMP_DIR}/sys"; do
+        mountpoint -q "${mp}" 2>/dev/null && umount -l "${mp}" 2>/dev/null || true
+    done
 
-# 挂载目录
-mount --bind /proc temp/proc
-mount --bind /dev temp/dev
-mount --bind /dev/pts temp/dev/pts
-mount --bind /sys temp/sys
+    for mp in $(findmnt -n -R -o TARGET "${TEMP_DIR}" 2>/dev/null | sort -r); do
+        [[ "${mp}" != "${TEMP_DIR}" ]] && umount -l "${mp}" 2>/dev/null || true
+    done
+
+    for mp in "${TEMP_DIR}" "${BUILD_DIR}" "${ORIG_DIR}"; do
+        mountpoint -q "${mp}" 2>/dev/null && umount -l "${mp}" 2>/dev/null || true
+    done
+
+    if [[ -n "${LOOP_DEV:-}" ]]; then
+        losetup -d "${LOOP_DEV}" 2>/dev/null || true
+    fi
+
+    if [[ "${KEEP_TEMP}" != "1" ]]; then
+        log_info "删除临时文件..."
+        rm -rf "${TEMP_IMG}" "${OUTPUT_IMG}" "${TEMP_DIR}" "${BUILD_DIR}" "${ORIG_DIR}"
+    else
+        log_info "调试模式：保留临时文件"
+    fi
+
+    log_info "清理完成"
+    exit ${exit_code}
+}
+trap cleanup EXIT INT TERM
+
+if [[ $EUID -ne 0 ]]; then
+    log_err "需要 root 权限"
+    exit 1
+fi
+
+check_deps() {
+    local deps=("dd" "mkfs.btrfs" "mount" "umount" "losetup" "chroot" "img2simg" "cp" "rm" "du" "partprobe" "findmnt")
+    local missing=()
+    for dep in "${deps[@]}"; do
+        command -v "${dep}" &>/dev/null || missing+=("${dep}")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_err "缺少工具: ${missing[*]}"
+        exit 1
+    fi
+}
+check_deps
+
+select_device() {
+    echo ""
+    echo "📱 ========== 选择构建的设备 =========="
+    echo "  1. ufi001c"
+    echo "  2. ufi003"
+    echo "======================================"
+    echo ""
+
+    local device_type
+    read -rep "请输入设备型号 [1-2]: " device_type
+
+    case "${device_type}" in
+        1) DEVICE="ufi001c" ;;
+        2) DEVICE="ufi003" ;;
+        *)
+            log_err "无效输入: '${device_type}'"
+            exit 1
+            ;;
+    esac
+    log_ok "已选择: ${DEVICE}"
+}
+
+select_device
+
+for path in "${ORIGINAL_IMG}" "${SCRIPT_DIR}/common-file" "${SCRIPT_DIR}/kernel" "${SCRIPT_DIR}/modem/firmware-${DEVICE}.deb" "${SCRIPT_DIR}/common-file/chroot.sh"; do
+    if [[ ! -e "${path}" ]]; then
+        log_err "不存在: ${path}"
+        exit 1
+    fi
+done
+
+log_info "创建工作目录..."
+mkdir -p "${ORIG_DIR}" "${BUILD_DIR}" "${TEMP_DIR}"
+
+LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
+sleep 1
+partprobe "${LOOP_DEV}" 2>/dev/null || true
+
+LOOP_PART="${LOOP_DEV}p1"
+[[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
+
+if [[ ! -b "${LOOP_PART}" ]]; then
+    log_err "找不到分区"
+    exit 1
+fi
+
+mount "${LOOP_PART}" "${ORIG_DIR}"
+ORIG_SIZE=$(calc_image_size "${ORIG_DIR}")
+EXTRA_SIZE=256
+TEMP_SIZE=$((ORIG_SIZE + EXTRA_SIZE))
+OUTPUT_SIZE=$((ORIG_SIZE + EXTRA_SIZE + 128))
+
+log_ok "原始: ${ORIG_SIZE}MB, 临时: ${TEMP_SIZE}MB, 输出: ${OUTPUT_SIZE}MB"
+
+umount "${ORIG_DIR}"
+losetup -d "${LOOP_DEV}"
+LOOP_DEV=""
+
+log_info "创建临时镜像..."
+dd if=/dev/zero of="${TEMP_IMG}" bs=1M count=${TEMP_SIZE} status=progress
+mkfs.btrfs -f "${TEMP_IMG}"
+
+log_info "创建输出镜像..."
+dd if=/dev/zero of="${OUTPUT_IMG}" bs=1M count=${OUTPUT_SIZE} status=progress
+mkfs.btrfs -f "${OUTPUT_IMG}"
+
+log_info "挂载镜像..."
+LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
+log_ok "loop: ${LOOP_DEV}"
+
+sleep 1
+partprobe "${LOOP_DEV}" 2>/dev/null || true
+
+LOOP_PART="${LOOP_DEV}p1"
+[[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
+
+mount -t btrfs -o compress=zstd:15 "${TEMP_IMG}" "${TEMP_DIR}"
+mount -t btrfs -o compress=zstd:15 "${OUTPUT_IMG}" "${BUILD_DIR}"
+mount "${LOOP_PART}" "${ORIG_DIR}"
+
+log_info "复制原始镜像..."
+cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
+
+log_info "复制构建文件..."
+mkdir -p "${TEMP_DIR}/tmp"
+cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/"
+cp -a "${SCRIPT_DIR}/kernel/." "${TEMP_DIR}/tmp/"
+cp "${SCRIPT_DIR}/modem/firmware-${DEVICE}.deb" "${TEMP_DIR}/tmp/"
+
+# 确保 /tmp 可写
+log_info "确保 /tmp 可写..."
+chmod 1777 "${TEMP_DIR}/tmp"
+
+# 修复 DNS
+log_info "配置 DNS..."
+rm -f "${TEMP_DIR}/etc/resolv.conf"
+cat > "${TEMP_DIR}/etc/resolv.conf" << 'EOF'
+nameserver 223.5.5.5
+nameserver 119.29.29.29
+EOF
+
+# 挂载额外分区
+log_info "检查额外分区..."
+for i in 2 3 4; do
+    PART="${LOOP_DEV}p${i}"
+    [[ ! -b "${PART}" ]] && PART="${LOOP_DEV}${i}"
+    [[ ! -b "${PART}" ]] && continue
+
+    LABEL=$(lsblk -no LABEL "${PART}" 2>/dev/null || echo "part${i}")
+    MOUNT_PT="${TEMP_DIR}/${LABEL}"
+
+    [[ -d "${MOUNT_PT}" ]] || mkdir -p "${MOUNT_PT}"
+
+    if mountpoint -q "${MOUNT_PT}" 2>/dev/null; then
+        log_warn "${MOUNT_PT} 已挂载，跳过"
+        continue
+    fi
+
+    mount "${PART}" "${MOUNT_PT}" 2>/dev/null && \
+        log_ok "挂载 ${PART} -> ${MOUNT_PT}" || \
+        log_warn "跳过 ${PART}（可能格式不支持）"
+done
+
+# 准备 chroot.sh
+log_info "准备 chroot 环境..."
+chmod +x "${TEMP_DIR}/tmp/chroot.sh"
+
+if file "${TEMP_DIR}/tmp/chroot.sh" | grep -q "CRLF"; then
+    log_info "转换 CRLF..."
+    sed -i 's/\r$//' "${TEMP_DIR}/tmp/chroot.sh"
+fi
+
+SHEBANG=$(head -1 "${TEMP_DIR}/tmp/chroot.sh")
+if [[ "${SHEBANG}" =~ ^#! ]]; then
+    INTERPRETER=$(echo "${SHEBANG}" | sed 's/^#! *//' | awk '{print $1}')
+    if [[ "${INTERPRETER}" == /* ]] && [[ ! -e "${TEMP_DIR}${INTERPRETER}" ]]; then
+        log_err "解释器不存在: ${INTERPRETER}"
+        exit 1
+    fi
+fi
+
+chmod 755 "${TEMP_DIR}/tmp"
+
+# 挂载虚拟文件系统
+log_info "挂载虚拟文件系统..."
+mount --bind /proc "${TEMP_DIR}/proc"
+mount --bind /dev "${TEMP_DIR}/dev"
+mount --bind /dev/pts "${TEMP_DIR}/dev/pts"
+mount --bind /sys "${TEMP_DIR}/sys"
 
 # 执行 chroot
-chroot temp /tmp/chroot.sh
+log_info "进入 chroot..."
+if [[ "${KEEP_TEMP}" == "1" ]]; then
+    log_info "chroot.sh 预览:"
+    head -10 "${TEMP_DIR}/tmp/chroot.sh" | sed 's/^/  /'
+fi
 
-# 清理临时文件
-rm -rf temp/tmp/*
+if ! chroot "${TEMP_DIR}" /tmp/chroot.sh; then
+    log_err "chroot 执行失败"
+    file "${TEMP_DIR}/tmp/chroot.sh"
+    exit 1
+fi
 
-# 卸载目录
-umount temp/proc
-umount temp/dev/pts
-umount temp/dev
-umount temp/sys
+# 清理
+log_info "清理临时文件..."
+rm -rf "${TEMP_DIR:?}/tmp"/*
 
-# 复制文件
-cp -a temp/* build
+log_info "卸载虚拟文件系统..."
+umount "${TEMP_DIR}/proc"
+umount "${TEMP_DIR}/dev/pts"
+umount "${TEMP_DIR}/dev"
+umount "${TEMP_DIR}/sys"
 
-# 卸载镜像
-umount temp
-umount build
-umount original_image
-losetup -d /dev/loop404
+for mp in $(findmnt -n -R -o TARGET "${TEMP_DIR}" 2>/dev/null | grep -v "^${TEMP_DIR}$" | sort -r); do
+    umount -l "${mp}" 2>/dev/null || true
+done
 
-# 转换镜像
-img2simg armbian-msm8916.img rootfs.img
+log_info "复制到输出镜像..."
+cp -a "${TEMP_DIR}/." "${BUILD_DIR}/"
 
-# 清理工作目录
-rm -rf temp.img armbian-msm8916.img temp build original_image
+log_info "卸载镜像..."
+umount "${TEMP_DIR}"
+umount "${BUILD_DIR}"
+umount "${ORIG_DIR}"
+losetup -d "${LOOP_DEV}"
+unset LOOP_DEV
+
+log_info "转换镜像..."
+img2simg "${OUTPUT_IMG}" "${FINAL_IMG}"
+log_ok "完成: ${FINAL_IMG}"
+ls -lh "${FINAL_IMG}"
+
+trap - EXIT
+[[ "${KEEP_TEMP}" != "1" ]] && rm -rf "${TEMP_IMG}" "${OUTPUT_IMG}" "${TEMP_DIR}" "${BUILD_DIR}" "${ORIG_DIR}"
+
+exit 0
