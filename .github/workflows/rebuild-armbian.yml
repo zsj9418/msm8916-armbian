@@ -1,8 +1,6 @@
 name: Armbian MSM8916 Rebuild Workflows
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
