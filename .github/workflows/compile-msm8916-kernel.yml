@@ -1,0 +1,194 @@
+#==========================================================================
+# Description: Compile msm8916 kernel for THWC UFI001C
+#==========================================================================
+
+name: Compile msm8916 kernel
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: "Select kernel config"
+        required: false
+        default: "msm8916_defconfig"
+        type: choice
+        options:
+          - msm8916_defconfig
+          - defconfig
+      ccache_clear:
+        description: "Set whether to clear the cache"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TZ: Etc/UTC
+  KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev dwarves fakeroot dpkg-dev debhelper rsync kmod cpio python3 git wget curl jq ccache libdw-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo -E timedatectl set-timezone "${TZ:-Etc/UTC}"
+          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo -E timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Clone kernel source
+        id: clone
+        run: |
+          cd /builder
+          git clone --depth=1 https://github.com/${{ env.KERNEL_REPO }}.git kernel
+          cd kernel
+          
+          # Get kernel version from Makefile
+          KERNEL_VERSION=$(grep -E "^VERSION = " Makefile | awk '{print $3}')
+          KERNEL_PATCHLEVEL=$(grep -E "^PATCHLEVEL = " Makefile | awk '{print $3}')
+          KERNEL_SUBLEVEL=$(grep -E "^SUBLEVEL = " Makefile | awk '{print $3}')
+          FULL_VERSION="${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}"
+          
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_ENV}
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "Kernel version: ${FULL_VERSION}"
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: /builder/kernel/.ccache
+          key: msm8916-${{ env.kernel_version }}-${{ github.sha }}
+          restore-keys: |
+            msm8916-${{ env.kernel_version }}-
+
+      - name: Compile kernel
+        id: compile
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+          
+          # Setup ccache
+          export CCACHE_DIR=/builder/kernel/.ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 5G
+          [[ "${{ inputs.ccache_clear }}" == "true" ]] && ccache -C
+          
+          # Export compiler flags
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export DTC_FLAGS="-@"
+          
+          # Load config
+          make ${{ inputs.kernel_config }}
+          
+          # Step 1: Compile kernel (Image.gz + dtbs)
+          make -j$(nproc) Image.gz dtbs
+          
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Build deb packages
+        id: debpkg
+        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+          
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # Step 2: Build deb packages (headers + image)
+          make -j$(nproc) bindeb-pkg LOCALVERSION=-msm8916 KDEB_PKGVERSION=${{ env.kernel_version }}-1 KDEB_SOURCENAME=linux-msm8916
+          
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Collect and package artifacts
+        id: package
+        if: ${{ steps.debpkg.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder
+          mkdir -p kernel_package
+          cd kernel_package
+          
+          KERNEL_VER="${{ env.kernel_version }}"
+          
+          # Copy compiled kernel files
+          cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
+          cp /builder/kernel/arch/arm64/boot/Image.gz ./
+          
+          # Find deb packages (bindeb-pkg outputs to parent dir /builder/)
+          find /builder -maxdepth 1 -name "linux-headers-*${KERNEL_VER}*.deb" ! -name "*dbg*" -type f -exec cp {} ./linux-headers.deb \;
+          find /builder -maxdepth 1 -name "linux-image-*${KERNEL_VER}*.deb" ! -name "*dbg*" -type f -exec cp {} ./linux-image.deb \;
+          
+          # Verify all files exist
+          echo "=== Package contents ==="
+          ls -la ./
+          
+          # Check required files
+          for f in msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: Missing file: $f"
+              exit 1
+            fi
+          done
+          
+          # Create tar.gz package
+          tar -czf "${KERNEL_VER}.tar.gz" msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb
+          
+          echo "package_path=/builder/kernel_package/${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
+          echo "package_name=${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Upload Kernel to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
+        with:
+          tag: kernel_stable
+          artifacts: ${{ env.package_path }}
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            These are Mainline LTS(Long Term Support) kernels that provide stable support for Armbian and OpenWrt.
+            这些是主线 LTS（长期支持）内核，为 Armbian 和 OpenWrt 提供稳定的支持。
