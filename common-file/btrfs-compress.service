@@ -1,0 +1,11 @@
+[Unit]
+Description=Enable btrfs compression on root
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/mount -o remount,compress=zstd:3 /dev/mmcblk0p14 /
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

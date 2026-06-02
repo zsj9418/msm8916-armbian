@@ -355,6 +355,7 @@ jobs:
               "${PKGS_DIR}/mobian-setup-usb-network.service:/usr/lib/systemd/system/mobian-setup-usb-network.service"
               "${PKGS_DIR}/openstick-expanddisk-startup.sh:/usr/sbin/openstick-expanddisk-startup.sh"
               "${PKGS_DIR}/rules.v4:/etc/iptables/rules.v4"
+              "${PKGS_DIR}/btrfs-compress.service:/usr/lib/systemd/system/btrfs-compress.service"
           )
           for pair in "${files[@]}"; do
               src="${pair%%:*}"
@@ -365,18 +366,23 @@ jobs:
               fi
           done
           
+          if [[ -f /usr/lib/systemd/system/btrfs-compress.service ]]; then
+              systemctl enable btrfs-compress.service
+          fi
           echo "LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0" > /etc/fstab
           if [[ -f /etc/rc.local ]]; then
               sed -i "13i\nmcli c u USB" /etc/rc.local || true
               sed -i "1s/-e//" /etc/rc.local
           fi
           if [[ -f /usr/lib/systemd/system/rc-local.service ]]; then sed -i "s/forking/idle/g" /usr/lib/systemd/system/rc-local.service; fi
+          
           if [[ -f /etc/armbian-release ]]; then
           # 替换 BOARD=odroidn2 为 BOARD=msm8916
           sed -i 's/BOARD=odroidn2/BOARD=msm8916/g' /etc/armbian-release
           # 替换 BOARD_NAME="Odroid N2" 为 BOARD_NAME="MSM8916"
           sed -i 's/BOARD_NAME="Odroid N2"/BOARD_NAME="MSM8916"/g' /etc/armbian-release
           fi
+          
           if [[ -f /etc/default/armbian-zram-config ]]; then
               sed -i "s/# ZRAM_PERCENTAGE=50/ZRAM_PERCENTAGE=300/g" /etc/default/armbian-zram-config
               sed -i "s/# MEM_LIMIT_PERCENTAGE=50/MEM_LIMIT_PERCENTAGE=300/g" /etc/default/armbian-zram-config
