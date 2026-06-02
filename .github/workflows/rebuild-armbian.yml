@@ -218,13 +218,16 @@ jobs:
           
           cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
           
-          mkdir -p "${TEMP_DIR}/tmp/kernel"
+          # 创建统一存放本地组件的 chroot 缓存路径
+          mkdir -p "${TEMP_DIR}/tmp/local_packages"
+          
           if [ -d "${SCRIPT_DIR}/kernel_debs" ]; then
-            cp ${SCRIPT_DIR}/kernel_debs/*.deb "${TEMP_DIR}/tmp/kernel/" || true
+            cp ${SCRIPT_DIR}/kernel_debs/*.deb "${TEMP_DIR}/tmp/local_packages/" || true
           fi
           
+          # 拷贝 common-file 目录下的全量包（包含 openstick-utils-all.deb 以及基础依赖）
           if [ -d "${SCRIPT_DIR}/common-file" ]; then
-            cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/" 2>/dev/null || true
+            cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/local_packages/" 2>/dev/null || true
           fi
           
           chmod 1777 "${TEMP_DIR}/tmp"
@@ -239,13 +242,14 @@ jobs:
           mount --bind /dev/pts "${TEMP_DIR}/dev/pts"
           mount --bind /sys "${TEMP_DIR}/sys"
           
-          # ==================== 🛠️ 核心修复：多发行版换源 Chroot 脚本 ====================
+          # ==================== 🛠️ 全量自由打包 Chroot 脚本 ====================
           cat > "${TEMP_DIR}/tmp/chroot_common.sh" << "EOF"
           #!/bin/bash
           set -euo pipefail
           
           export DEBIAN_FRONTEND=noninteractive
           LOG_FILE="/tmp/chroot-build.log"
+          PKGS_DIR="/tmp/local_packages"
           
           log_info() { echo "🚀 $*"; echo "$(date "+%Y-%m-%d %H:%M:%S") [INFO] $*" >> "${LOG_FILE}"; }
           log_ok()   { echo "✅ $*"; echo "$(date "+%Y-%m-%d %H:%M:%S") [OK] $*" >> "${LOG_FILE}"; }
@@ -256,7 +260,7 @@ jobs:
           if ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1; then
               log_ok "网络连通（IP层）"
           else
-              log_warn "网络连接异常，尝试重置 resolv.conf"
+              log_warn "网络异常，覆写 DNS 备份集..."
               cat > /etc/resolv.conf << "EOM"
           nameserver 223.5.5.5
           nameserver 119.29.29.29
@@ -266,15 +270,15 @@ jobs:
           log_info "修复 /tmp 权限..."
           chmod 1777 /tmp
           
-          log_info "根据 /etc/os-release 动态适配软件源配置..."
+          log_info "从 /etc/os-release 获取系统的真实 ID 和代号进行安全换源..."
           if [ -f /etc/os-release ]; then
               . /etc/os-release
               DISTRO_ID="${ID:-debian}"
               CODENAME="${VERSION_CODENAME:-trixie}"
-              log_info "识别到发行版 ID: ${DISTRO_ID}, 代号: ${CODENAME}"
+              log_info "识别到发行版: ${DISTRO_ID} | 系统代号: ${CODENAME}"
               
               if [ "${DISTRO_ID}" = "ubuntu" ]; then
-                  log_info "正在配置 Ubuntu (${CODENAME}) 阿里云 ports 软件源..."
+                  log_info "正在写入 Ubuntu Ports 阿里云镜像站源..."
                   cat > /etc/apt/sources.list << EOM
           deb http://mirrors.aliyun.com/ubuntu-ports/ ${CODENAME} main restricted universe multiverse
           deb http://mirrors.aliyun.com/ubuntu-ports/ ${CODENAME}-updates main restricted universe multiverse
@@ -282,7 +286,7 @@ jobs:
           deb http://mirrors.aliyun.com/ubuntu-ports/ ${CODENAME}-security main restricted universe multiverse
           EOM
               else
-                  log_info "正在配置 Debian (${CODENAME}) 阿里云软件源..."
+                  log_info "正在写入 Debian 阿里云镜像站源..."
                   cat > /etc/apt/sources.list << EOM
           deb http://mirrors.aliyun.com/debian ${CODENAME} main contrib non-free non-free-firmware
           deb http://mirrors.aliyun.com/debian ${CODENAME}-updates main contrib non-free non-free-firmware
@@ -290,14 +294,14 @@ jobs:
           EOM
               fi
           else
-              log_warn "/etc/os-release 未找到，回退到默认 Debian Trixie 源"
+              log_warn "/etc/os-release 丢失，回退至 Debian Trixie 默认配置"
               cat > /etc/apt/sources.list << "EOM"
           deb http://mirrors.aliyun.com/debian trixie main contrib non-free non-free-firmware
           EOM
           fi
           
           apt-get update || {
-              log_warn "首轮 apt update 失败，重置备用 DNS..."
+              log_warn "首轮 apt 更新失败，重试中..."
               cat > /etc/resolv.conf << "EOM"
           nameserver 223.5.5.5
           nameserver 119.29.29.29
@@ -305,22 +309,27 @@ jobs:
               apt-get update || exit 1
           }
           
-          log_info "清除旧内核与冲突包..."
+          log_info "卸载冲突的老旧内核或固件..."
           pkgs=$(dpkg -l 2>/dev/null | grep -E "meson|linux-image" | awk "{print \$2}" || true)
           if [[ -n "${pkgs}" ]]; then echo "${pkgs}" | xargs -r dpkg -P; fi
           rm -rf /boot/* && mkdir -p /boot
           
-          log_info "安装公共自定义内核包..."
-          if ls /tmp/kernel/*.deb >/dev/null 2>&1; then
-              dpkg -i /tmp/kernel/linux-image.deb /tmp/kernel/linux-headers.deb || apt-get --fix-broken install -y
+          log_info "🚀 核心步骤：一记重锤！直接轰入本地 common-file 下的所有 deb 包..."
+          if ls "${PKGS_DIR}"/*.deb >/dev/null 2>&1; then
+              # 👇 这里直接无差别强行 dpkg -i 安装所有 deb
+              dpkg -i "${PKGS_DIR}"/*.deb 2>/dev/null || true
           else
-              log_err "未在指定路径找到内核 deb 包！"
+              log_err "CRITICAL: 未在缓存中检测到任何本地依赖包！"
           fi
           
-          log_info "安全顺序安装基础组件..."
-          apt-get install -y --no-install-recommends coreutils network-manager modemmanager bc bsdmainutils gawk libqmi-utils iptables-persistent dnsmasq-base locales
+          log_info "拉取云端基础核心组件网络包..."
+          apt-get install -y --no-install-recommends coreutils network-manager modemmanager bc bsdmainutils gawk locales libqmi-utils dnsmasq-base iptables-persistent
           
-          log_info "配置多语言环境环境..."
+          log_info "🔨 依赖解耦：让 apt 自动处理并解开上面所有 deb 的安装依赖顺序..."
+          # 👇 这一步会完美收尾：自动补齐依赖，并配置好刚刚无序 dpkg 的所有本地包
+          apt-get --fix-broken install -y
+          
+          log_info "配置多语言集生成..."
           sed -i "s/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/" /etc/locale.gen || true
           sed -i "s/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/" /etc/locale.gen || true
           sed -i "s/^# *zh_CN GB2312/zh_CN GB2312/" /etc/locale.gen || true
@@ -332,19 +341,19 @@ jobs:
           export LC_ALL=zh_CN.UTF-8
           export LANGUAGE=zh_CN:zh
           
-          log_info "配置 iptables 后端..."
-          update-alternatives --set iptables /usr/sbin/iptables-legacy || log_warn "iptables 切换失败"
+          log_info "将 iptables 切换为兼容后端模式..."
+          update-alternatives --set iptables /usr/sbin/iptables-legacy || log_warn "切换至 iptables-legacy 失败"
           
-          log_info "应用自定义网络脚本与服务配置..."
+          log_info "应用自定义核心网络工具脚本注入覆盖..."
           rm -f /usr/sbin/openstick-startup-diagnose.sh
           rm -f /usr/lib/systemd/system/openstick-startup-diagnose.service
           rm -f /usr/lib/systemd/system/openstick-startup-diagnose.timer
           
           files=(
-              "/tmp/mobian-setup-usb-network:/usr/sbin/mobian-setup-usb-network"
-              "/tmp/mobian-setup-usb-network.service:/usr/lib/systemd/system/mobian-setup-usb-network.service"
-              "/tmp/openstick-expanddisk-startup.sh:/usr/sbin/openstick-expanddisk-startup.sh"
-              "/tmp/rules.v4:/etc/iptables/rules.v4"
+              "${PKGS_DIR}/mobian-setup-usb-network:/usr/sbin/mobian-setup-usb-network"
+              "${PKGS_DIR}/mobian-setup-usb-network.service:/usr/lib/systemd/system/mobian-setup-usb-network.service"
+              "${PKGS_DIR}/openstick-expanddisk-startup.sh:/usr/sbin/openstick-expanddisk-startup.sh"
+              "${PKGS_DIR}/rules.v4:/etc/iptables/rules.v4"
           )
           for pair in "${files[@]}"; do
               src="${pair%%:*}"
@@ -374,7 +383,7 @@ jobs:
           ln -sf /usr/share/zoneinfo/Asia/Chongqing /etc/localtime
           if [[ -d /etc/update-motd.d ]]; then chmod +x /etc/update-motd.d/* 2>/dev/null || true; fi
           
-          log_ok "Chroot 环节多版本优化构建成功！"
+          log_ok "公共底层及高级依赖全量包 Chroot 重构结束！"
           EOF
           # =================================================================
 
@@ -394,7 +403,7 @@ jobs:
           losetup -d "${LOOP_DEV}"
           
           # ------------------ 分支处理 1: UFI001C ------------------
-          echo "🌿 正在为 UFI001C 装配固件包..."
+          echo "🌿 正在为 UFI001C 装配特定硬件固件包..."
           OUTPUT_IMG_001C="${SCRIPT_DIR}/armbian-msm8916-ufi001c.img"
           BUILD_DIR_001C="${SCRIPT_DIR}/build_ufi001c"
           mkdir -p "${BUILD_DIR_001C}"
@@ -419,7 +428,7 @@ jobs:
           img2simg "${OUTPUT_IMG_001C}" "${SCRIPT_DIR}/rootfs_ufi001c.img"
           
           # ------------------ 分支处理 2: UFI003 ------------------
-          echo "🌿 正在为 UFI003 装配固件包..."
+          echo "🌿 正在为 UFI003 装配特定硬件固件包..."
           OUTPUT_IMG_003="${SCRIPT_DIR}/armbian-msm8916-ufi003.img"
           BUILD_DIR_003="${SCRIPT_DIR}/build_ufi003"
           mkdir -p "${BUILD_DIR_003}"
@@ -444,7 +453,7 @@ jobs:
           img2simg "${OUTPUT_IMG_003}" "${SCRIPT_DIR}/rootfs_ufi003.img"
           
           umount "${TEMP_DIR}"
-          echo "✅ 所有系统分支打包流程结束！"
+          echo "✅ [SUCCESS] 4款操作系统根文件系统构建流完结！"
           '
 
       - name: Create Unified Boot Image
