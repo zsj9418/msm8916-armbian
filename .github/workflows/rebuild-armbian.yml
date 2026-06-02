@@ -218,14 +218,12 @@ jobs:
           
           cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
           
-          # 创建统一存放本地组件的 chroot 缓存路径
           mkdir -p "${TEMP_DIR}/tmp/local_packages"
           
           if [ -d "${SCRIPT_DIR}/kernel_debs" ]; then
             cp ${SCRIPT_DIR}/kernel_debs/*.deb "${TEMP_DIR}/tmp/local_packages/" || true
           fi
           
-          # 拷贝 common-file 目录下的全量包（包含 openstick-utils-all.deb 以及基础依赖）
           if [ -d "${SCRIPT_DIR}/common-file" ]; then
             cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/local_packages/" 2>/dev/null || true
           fi
@@ -242,7 +240,7 @@ jobs:
           mount --bind /dev/pts "${TEMP_DIR}/dev/pts"
           mount --bind /sys "${TEMP_DIR}/sys"
           
-          # ==================== 🛠️ 全量自由打包 Chroot 脚本 ====================
+          # ==================== 🛠️ 调整完顺序的 Chroot 脚本 ====================
           cat > "${TEMP_DIR}/tmp/chroot_common.sh" << "EOF"
           #!/bin/bash
           set -euo pipefail
@@ -314,19 +312,22 @@ jobs:
           if [[ -n "${pkgs}" ]]; then echo "${pkgs}" | xargs -r dpkg -P; fi
           rm -rf /boot/* && mkdir -p /boot
           
-          log_info "🚀 核心步骤：一记重锤！直接轰入本地 common-file 下的所有 deb 包..."
+          log_info "🚀 核心步骤：直接轰入本地 common-file 下的所有 deb 包..."
           if ls "${PKGS_DIR}"/*.deb >/dev/null 2>&1; then
-              # 👇 这里直接无差别强行 dpkg -i 安装所有 deb
               dpkg -i "${PKGS_DIR}"/*.deb 2>/dev/null || true
           else
               log_err "CRITICAL: 未在缓存中检测到任何本地依赖包！"
           fi
           
+          # ✨修复重点：立刻上阵联网修复未闭合的本地包依赖！
+          log_info "🔨 依赖解耦：第一步，立刻让 apt 联网下载并修复所有本地 deb 的依赖..."
+          apt-get --fix-broken install -y
+          
           log_info "拉取云端基础核心组件网络包..."
+          # ✨此时依赖树已安全闭合，可以毫无阻碍地进行大规模网络套件安装
           apt-get install -y --no-install-recommends coreutils network-manager modemmanager bc bsdmainutils gawk locales libqmi-utils dnsmasq-base iptables-persistent
           
-          log_info "🔨 依赖解耦：让 apt 自动处理并解开上面所有 deb 的安装依赖顺序..."
-          # 👇 这一步会完美收尾：自动补齐依赖，并配置好刚刚无序 dpkg 的所有本地包
+          log_info "🔨 依赖解耦：第二步，进行最终状态复验确认..."
           apt-get --fix-broken install -y
           
           log_info "配置多语言集生成..."
