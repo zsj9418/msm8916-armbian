@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: "${{ steps.set-matrix.outputs.matrix }}"
+      tag_name: "${{ steps.set-tag.outputs.tag_name }}"
     steps:
       - name: Get Armbian Versions
         id: set-matrix
@@ -20,9 +21,9 @@ jobs:
           echo "Fetching available Armbian versions..."
           REPO="ophub/amlogic-s9xxx-armbian"
           API_URL="https://api.github.com/repos/${REPO}/releases?per_page=30"
-          
+
           RESPONSE=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
-          
+
           if echo "$RESPONSE" | jq -e '. | type == "array"' >/dev/null 2>&1; then
             echo "✅ Valid JSON response received"
           else
@@ -30,16 +31,16 @@ jobs:
             echo "$RESPONSE" | head -n 10 || true
             exit 1
           fi
-          
+
           echo "$RESPONSE" > response.json
-          
+
           VERSIONS=$(echo "$RESPONSE" | jq -r '.[] | select(.tag_name | contains("arm64")) | .tag_name' | head -n 10)
-          
+
           if [ -z "$VERSIONS" ]; then
             echo "❌ Error: Cannot extract any versions containing 'arm64'."
             exit 1
           fi
-          
+
           VERSION_CODES=""
           while IFS= read -r tag; do
             if [[ $tag =~ ^Armbian_([a-zA-Z0-9]+)_arm64 ]]; then
@@ -49,14 +50,14 @@ jobs:
               fi
             fi
           done <<< "$VERSIONS"
-          
+
           VERSION_CODES=$(echo $VERSION_CODES | tr ' ' '\n' | sort -u | tr '\n' ' ')
-          
+
           if [ -z "$VERSION_CODES" ]; then
             echo "❌ Error: Cannot extract any valid version codes."
             exit 1
           fi
-          
+
           JSON_ARRAY="["
           first=true
           for ver in $VERSION_CODES; do
@@ -68,9 +69,17 @@ jobs:
             fi
           done
           JSON_ARRAY="${JSON_ARRAY}]"
-          
+
           echo "Generated Matrix: ${JSON_ARRAY}"
           echo "matrix=${JSON_ARRAY}" >> $GITHUB_OUTPUT
+
+      - name: Generate Unified Tag Name
+        id: set-tag
+        run: |
+          # 统一时间戳格式: 2026.05.28-1207
+          TAG_NAME=$(date +%Y.%m.%d-%H%M)
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "🎯 Unified release tag: ${TAG_NAME}"
 
   build:
     needs: get-versions
@@ -94,10 +103,10 @@ jobs:
             fakeroot dpkg-dev debhelper devscripts equivs kmod xz-utils \
             zstd python3 e2fsprogs fdisk util-linux android-sdk-libsparse-utils \
             qemu-user-static jq
-          
+
           sudo apt-get purge -y mkbootimg || true
           sudo rm -f /usr/bin/mkbootimg /usr/local/bin/mkbootimg
-          
+
           sudo wget -q "https://android.googlesource.com/platform/system/tools/mkbootimg/+/9c46d9eee9a1b469ccf46db917ac78fc9f0fdaf1/mkbootimg.py?format=TEXT" -O /tmp/mkbootimg.b64
           base64 -d /tmp/mkbootimg.b64 > /tmp/mkbootimg
           sudo chmod +x /tmp/mkbootimg
@@ -110,24 +119,24 @@ jobs:
           REPO="ophub/amlogic-s9xxx-armbian"
           API_URL="https://api.github.com/repos/${REPO}/releases"
           SELECTED_VER="${{ matrix.version }}"
-          
+
           RELEASES_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
           FULL_TAG=$(echo "$RELEASES_JSON" | jq -r ".[] | select(.tag_name | contains(\"${SELECTED_VER}\") and contains(\"arm64\")) | .tag_name" | head -n 1)
-          
+
           if [ -z "${FULL_TAG}" ] || [ "${FULL_TAG}" = "null" ]; then
             exit 1
           fi
-          
+
           ASSETS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}/tags/${FULL_TAG}")
           TRUNK_FILE=$(echo "$ASSETS_JSON" | jq -r '.assets[] | select(.name | test("trunk.*\\.(img|gz|xz|zip)$")) | .name' | head -n 1)
-          
+
           if [ -z "${TRUNK_FILE}" ] || [ "${TRUNK_FILE}" = "null" ]; then
             TRUNK_FILE=$(echo "$ASSETS_JSON" | jq -r '.assets[] | select(.name | test("\\.(img|gz|xz|zip)$")) | .name' | head -n 1)
           fi
-          
+
           DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${FULL_TAG}/${TRUNK_FILE}"
           wget -q --show-progress -c "${DOWNLOAD_URL}" -O "${TRUNK_FILE}"
-          
+
           if [[ "$TRUNK_FILE" == *.gz ]]; then
               gunzip -k "${TRUNK_FILE}" 2>/dev/null || gunzip "${TRUNK_FILE}"
               IMGFILE="${TRUNK_FILE%.gz}"
@@ -137,7 +146,7 @@ jobs:
           else
               IMGFILE="$TRUNK_FILE"
           fi
-          
+
           mv "${IMGFILE}" armbian.img
 
       - name: Download Latest MSM8916 Kernel Components
@@ -148,27 +157,27 @@ jobs:
           cd kernel_debs
           API_URL="https://api.github.com/repos/${{ github.repository }}/releases/tags/kernel_stable"
           KERNEL_ASSETS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
-          
+
           KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r '.assets[] | select(.name | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz$")) | .browser_download_url' | head -n 1)
-          
+
           wget -q "${KERNEL_TAR_URL}" -O kernel-package.tar.gz
           tar -xzvf kernel-package.tar.gz
-          
+
           IMAGE_DEB=$(find . -name "*image*.deb" ! -name "linux-image.deb" | head -n 1)
           [ -n "$IMAGE_DEB" ] && mv "$IMAGE_DEB" linux-image.deb || true
-          
+
           HEADERS_DEB=$(find . -name "*headers*.deb" ! -name "linux-headers.deb" | head -n 1)
           [ -n "$HEADERS_DEB" ] && mv "$HEADERS_DEB" linux-headers.deb || true
-          
+
           IMG_GZ=$(find . -name "Image.gz" | head -n 1)
           if [ -z "$IMG_GZ" ]; then
              ALT_IMG_GZ=$(find . -name "*Image*.gz" | head -n 1)
              [ -n "$ALT_IMG_GZ" ] && mv "$ALT_IMG_GZ" Image.gz
           fi
-          
+
           DTB_FILE=$(find . -name "*ufi001c*.dtb" ! -name "msm8916-thwc-ufi001c.dtb" | head -n 1)
           [ -n "$DTB_FILE" ] && mv "$DTB_FILE" msm8916-thwc-ufi001c.dtb || true
-          
+
           rm -f kernel-package.tar.gz
           cd ..
 
@@ -182,78 +191,78 @@ jobs:
         run: |
           sudo -E bash -c '
           set -euo pipefail
-          
+
           SCRIPT_DIR="$(pwd)"
           ORIG_DIR="${SCRIPT_DIR}/original_image"
           TEMP_DIR="${SCRIPT_DIR}/temp_common"
           TEMP_IMG="${SCRIPT_DIR}/temp_common.img"
           ORIGINAL_IMG="${SCRIPT_DIR}/armbian.img"
-          
+
           mkdir -p "${ORIG_DIR}" "${TEMP_DIR}"
-          
+
           LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
           sleep 1
           partprobe "${LOOP_DEV}" 2>/dev/null || true
           LOOP_PART="${LOOP_DEV}p1" && [[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
-          
+
           mount "${LOOP_PART}" "${ORIG_DIR}"
           bytes=$(du -sb "${ORIG_DIR}" 2>/dev/null | cut -f1)
           ORIG_SIZE=$(( (bytes / 1024 / 1024) + (bytes / 1024 / 1024 / 5) + 64 ))
           EXTRA_SIZE=512
           TEMP_SIZE=$((ORIG_SIZE + EXTRA_SIZE))
           OUTPUT_SIZE=$((ORIG_SIZE + EXTRA_SIZE + 128))
-          
+
           umount "${ORIG_DIR}"
           losetup -d "${LOOP_DEV}"
-          
+
           dd if=/dev/zero of="${TEMP_IMG}" bs=1M count=${TEMP_SIZE} status=none
           mkfs.btrfs -f "${TEMP_IMG}"
-          
+
           LOOP_DEV=$(losetup -f --show "${ORIGINAL_IMG}")
           partprobe "${LOOP_DEV}" 2>/dev/null || true
           LOOP_PART="${LOOP_DEV}p1" && [[ ! -b "${LOOP_PART}" ]] && LOOP_PART="${LOOP_DEV}1"
-          
+
           mount -t btrfs -o compress=zstd:15 "${TEMP_IMG}" "${TEMP_DIR}"
           mount "${LOOP_PART}" "${ORIG_DIR}"
-          
+
           cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
-          
+
           mkdir -p "${TEMP_DIR}/tmp/local_packages"
-          
+
           if [ -d "${SCRIPT_DIR}/kernel_debs" ]; then
             cp ${SCRIPT_DIR}/kernel_debs/*.deb "${TEMP_DIR}/tmp/local_packages/" || true
           fi
-          
+
           if [ -d "${SCRIPT_DIR}/common-file" ]; then
             cp -a "${SCRIPT_DIR}/common-file/." "${TEMP_DIR}/tmp/local_packages/" 2>/dev/null || true
           fi
-          
+
           chmod 1777 "${TEMP_DIR}/tmp"
           rm -f "${TEMP_DIR}/etc/resolv.conf"
           cat > "${TEMP_DIR}/etc/resolv.conf" << "EOF"
           nameserver 223.5.5.5
           nameserver 119.29.29.29
           EOF
-          
+
           mount --bind /proc "${TEMP_DIR}/proc"
           mount --bind /dev "${TEMP_DIR}/dev"
           mount --bind /dev/pts "${TEMP_DIR}/dev/pts"
           mount --bind /sys "${TEMP_DIR}/sys"
-          
+
           # ==================== 🛠️ 调整完顺序的 Chroot 脚本 ====================
           cat > "${TEMP_DIR}/tmp/chroot_common.sh" << "EOF"
           #!/bin/bash
           set -euo pipefail
-          
+
           export DEBIAN_FRONTEND=noninteractive
           LOG_FILE="/tmp/chroot-build.log"
           PKGS_DIR="/tmp/local_packages"
-          
+
           log_info() { echo "🚀 $*"; echo "$(date "+%Y-%m-%d %H:%M:%S") [INFO] $*" >> "${LOG_FILE}"; }
           log_ok()   { echo "✅ $*"; echo "$(date "+%Y-%m-%d %H:%M:%S") [OK] $*" >> "${LOG_FILE}"; }
           log_warn() { echo "⚠️  $*"; echo "$(date "+%Y-%m-%d %H:%M:%S") [WARN] $*" >> "${LOG_FILE}"; }
           log_err()  { echo "❌ $*" >&2; echo "$(date "+%Y-%m-%d %H:%M:%S") [ERROR] $*" >> "${LOG_FILE}"; }
-          
+
           log_info "检查 chroot 网络环境..."
           if ping -c 1 -W 3 223.5.5.5 >/dev/null 2>&1; then
               log_ok "网络连通（IP层）"
@@ -264,17 +273,17 @@ jobs:
           nameserver 119.29.29.29
           EOM
           fi
-          
+
           log_info "修复 /tmp 权限..."
           chmod 1777 /tmp
-          
+
           log_info "从 /etc/os-release 获取系统的真实 ID 和代号进行安全换源..."
           if [ -f /etc/os-release ]; then
               . /etc/os-release
               DISTRO_ID="${ID:-debian}"
               CODENAME="${VERSION_CODENAME:-trixie}"
               log_info "识别到发行版: ${DISTRO_ID} | 系统代号: ${CODENAME}"
-              
+
               if [ "${DISTRO_ID}" = "ubuntu" ]; then
                   log_info "正在写入 Ubuntu Ports 阿里云镜像站源..."
                   cat > /etc/apt/sources.list << EOM
@@ -297,7 +306,7 @@ jobs:
           deb http://mirrors.aliyun.com/debian trixie main contrib non-free non-free-firmware
           EOM
           fi
-          
+
           apt-get update || {
               log_warn "首轮 apt 更新失败，重试中..."
               cat > /etc/resolv.conf << "EOM"
@@ -306,50 +315,50 @@ jobs:
           EOM
               apt-get update || exit 1
           }
-          
+
           log_info "卸载冲突的老旧内核或固件..."
           pkgs=$(dpkg -l 2>/dev/null | grep -E "meson|linux-image" | awk "{print \$2}" || true)
           if [[ -n "${pkgs}" ]]; then echo "${pkgs}" | xargs -r dpkg -P; fi
           rm -rf /boot/* && mkdir -p /boot
-          
+
           log_info "🚀 核心步骤：直接轰入本地 common-file 下的所有 deb 包..."
           if ls "${PKGS_DIR}"/*.deb >/dev/null 2>&1; then
               dpkg -i "${PKGS_DIR}"/*.deb 2>/dev/null || true
           else
               log_err "CRITICAL: 未在缓存中检测到任何本地依赖包！"
           fi
-          
+
           # ✨修复重点：立刻上阵联网修复未闭合的本地包依赖！
           log_info "🔨 依赖解耦：第一步，立刻让 apt 联网下载并修复所有本地 deb 的依赖..."
           apt-get --fix-broken install -y
-          
+
           log_info "拉取云端基础核心组件网络包..."
           # ✨此时依赖树已安全闭合，可以毫无阻碍地进行大规模网络套件安装
           apt-get install -y --no-install-recommends coreutils network-manager modemmanager bc bsdmainutils gawk locales libqmi-utils dnsmasq-base iptables-persistent
-          
+
           log_info "🔨 依赖解耦：第二步，进行最终状态复验确认..."
           apt-get --fix-broken install -y
-          
+
           log_info "配置多语言集生成..."
           sed -i "s/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/" /etc/locale.gen || true
           sed -i "s/^# *zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/" /etc/locale.gen || true
           sed -i "s/^# *zh_CN GB2312/zh_CN GB2312/" /etc/locale.gen || true
           locale-gen
-          
+
           unset LANGUAGE LC_ALL LC_MESSAGES LANG
           update-locale --reset LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 LANGUAGE=zh_CN:zh
           export LANG=zh_CN.UTF-8
           export LC_ALL=zh_CN.UTF-8
           export LANGUAGE=zh_CN:zh
-          
+
           log_info "将 iptables 切换为兼容后端模式..."
           update-alternatives --set iptables /usr/sbin/iptables-legacy || log_warn "切换至 iptables-legacy 失败"
-          
+
           log_info "应用自定义核心网络工具脚本注入覆盖..."
           rm -f /usr/sbin/openstick-startup-diagnose.sh
           rm -f /usr/lib/systemd/system/openstick-startup-diagnose.service
           rm -f /usr/lib/systemd/system/openstick-startup-diagnose.timer
-          
+
           files=(
               "${PKGS_DIR}/mobian-setup-usb-network:/usr/sbin/mobian-setup-usb-network"
               "${PKGS_DIR}/mobian-setup-usb-network.service:/usr/lib/systemd/system/mobian-setup-usb-network.service"
@@ -365,7 +374,7 @@ jobs:
                   chmod +x "${dst}" 2>/dev/null || true
               fi
           done
-          
+
           if [[ -f /usr/lib/systemd/system/btrfs-compress.service ]]; then
               systemctl enable btrfs-compress.service
           fi
@@ -375,14 +384,12 @@ jobs:
               sed -i "1s/-e//" /etc/rc.local
           fi
           if [[ -f /usr/lib/systemd/system/rc-local.service ]]; then sed -i "s/forking/idle/g" /usr/lib/systemd/system/rc-local.service; fi
-          
+
           if [[ -f /etc/armbian-release ]]; then
-          # 替换 BOARD=odroidn2 为 BOARD=msm8916
           sed -i 's/BOARD=odroidn2/BOARD=msm8916/g' /etc/armbian-release
-          # 替换 BOARD_NAME="Odroid N2" 为 BOARD_NAME="MSM8916"
           sed -i 's/BOARD_NAME="Odroid N2"/BOARD_NAME="MSM8916"/g' /etc/armbian-release
           fi
-          
+
           if [[ -f /etc/default/armbian-zram-config ]]; then
               sed -i "s/# ZRAM_PERCENTAGE=50/ZRAM_PERCENTAGE=300/g" /etc/default/armbian-zram-config
               sed -i "s/# MEM_LIMIT_PERCENTAGE=50/MEM_LIMIT_PERCENTAGE=300/g" /etc/default/armbian-zram-config
@@ -390,18 +397,18 @@ jobs:
           if [[ -f /usr/sbin/openstick-sim-changer.sh ]]; then
               sed -i "21 s/\$sim/sim:sel/" /usr/sbin/openstick-sim-changer.sh
           fi
-          
+
           rm -f /etc/localtime
           ln -sf /usr/share/zoneinfo/Asia/Chongqing /etc/localtime
           if [[ -d /etc/update-motd.d ]]; then chmod +x /etc/update-motd.d/* 2>/dev/null || true; fi
-          
+
           log_ok "公共底层及高级依赖全量包 Chroot 重构结束！"
           EOF
           # =================================================================
 
           chmod +x "${TEMP_DIR}/tmp/chroot_common.sh"
           chroot "${TEMP_DIR}" /tmp/chroot_common.sh
-          
+
           INITRD_PATH=$(ls -1 "${TEMP_DIR}/boot"/initrd.img-* | head -n 1 || echo "")
           if [ -n "${INITRD_PATH}" ]; then
             cp "${INITRD_PATH}" "${SCRIPT_DIR}/initrd_ufi001c.img"
@@ -409,21 +416,21 @@ jobs:
           else
             echo "ERROR: initrd.img missing!" && exit 1
           fi
-          
+
           umount "${TEMP_DIR}/proc" "${TEMP_DIR}/dev/pts" "${TEMP_DIR}/dev" "${TEMP_DIR}/sys"
           umount "${ORIG_DIR}"
           losetup -d "${LOOP_DEV}"
-          
+
           # ------------------ 分支处理 1: UFI001C ------------------
           echo "🌿 正在为 UFI001C 装配特定硬件固件包..."
           OUTPUT_IMG_001C="${SCRIPT_DIR}/armbian-msm8916-ufi001c.img"
           BUILD_DIR_001C="${SCRIPT_DIR}/build_ufi001c"
           mkdir -p "${BUILD_DIR_001C}"
-          
+
           dd if=/dev/zero of="${OUTPUT_IMG_001C}" bs=1M count=${OUTPUT_SIZE} status=none
           mkfs.btrfs -f "${OUTPUT_IMG_001C}"
           mount -t btrfs -o compress=zstd:15 "${OUTPUT_IMG_001C}" "${BUILD_DIR_001C}"
-          
+
           cp -a "${TEMP_DIR}/." "${BUILD_DIR_001C}/"
           if [ -f "${SCRIPT_DIR}/firmware_debs/firmware-ufi001c.deb" ]; then
              cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi001c.deb" "${BUILD_DIR_001C}/tmp/"
@@ -433,22 +440,22 @@ jobs:
              chroot "${BUILD_DIR_001C}" bash -c "dpkg -i /tmp/firmware-ufi001c.deb || apt-get --fix-broken install -y"
              umount "${BUILD_DIR_001C}/proc" "${BUILD_DIR_001C}/dev" "${BUILD_DIR_001C}/sys"
           fi
-          
+
           chroot "${BUILD_DIR_001C}" bash -c "rm -rf /var/lib/apt/lists/* && apt-get clean all"
           rm -rf "${BUILD_DIR_001C}/tmp"/*
           umount "${BUILD_DIR_001C}"
           img2simg "${OUTPUT_IMG_001C}" "${SCRIPT_DIR}/rootfs_ufi001c.img"
-          
+
           # ------------------ 分支处理 2: UFI003 ------------------
           echo "🌿 正在为 UFI003 装配特定硬件固件包..."
           OUTPUT_IMG_003="${SCRIPT_DIR}/armbian-msm8916-ufi003.img"
           BUILD_DIR_003="${SCRIPT_DIR}/build_ufi003"
           mkdir -p "${BUILD_DIR_003}"
-          
+
           dd if=/dev/zero of="${OUTPUT_IMG_003}" bs=1M count=${OUTPUT_SIZE} status=none
           mkfs.btrfs -f "${OUTPUT_IMG_003}"
           mount -t btrfs -o compress=zstd:15 "${OUTPUT_IMG_003}" "${BUILD_DIR_003}"
-          
+
           cp -a "${TEMP_DIR}/." "${BUILD_DIR_003}/"
           if [ -f "${SCRIPT_DIR}/firmware_debs/firmware-ufi003.deb" ]; then
              cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi003.deb" "${BUILD_DIR_003}/tmp/"
@@ -458,12 +465,12 @@ jobs:
              chroot "${BUILD_DIR_003}" bash -c "dpkg -i /tmp/firmware-ufi003.deb || apt-get --fix-broken install -y"
              umount "${BUILD_DIR_003}/proc" "${BUILD_DIR_003}/dev" "${BUILD_DIR_003}/sys"
           fi
-          
+
           chroot "${BUILD_DIR_003}" bash -c "rm -rf /var/lib/apt/lists/* && apt-get clean all"
           rm -rf "${BUILD_DIR_003}/tmp"/*
           umount "${BUILD_DIR_003}"
           img2simg "${OUTPUT_IMG_003}" "${SCRIPT_DIR}/rootfs_ufi003.img"
-          
+
           umount "${TEMP_DIR}"
           echo "✅ [SUCCESS] 4款操作系统根文件系统构建流完结！"
           '
@@ -472,7 +479,7 @@ jobs:
         run: |
           mkdir -p output_dist
           cat kernel_debs/Image.gz kernel_debs/msm8916-thwc-ufi001c.dtb > unified-kernel-dtb
-          
+
           mkbootimg \
             --base 0x80000000 \
             --kernel_offset 0x00080000 \
@@ -484,7 +491,7 @@ jobs:
             --cmdline "earlycon root=/dev/mmcblk0p14 rootwait console=ttyMSM0,115200 no_framebuffer=true rw" \
             --kernel unified-kernel-dtb \
             -o output_dist/boot.img
-          
+
           echo "✅ Unified boot.img successfully packed!"
           cp rootfs_ufi001c.img output_dist/rootfs_ufi001c.img
           cp rootfs_ufi003.img output_dist/rootfs_ufi003.img
@@ -493,24 +500,22 @@ jobs:
         run: |
           VERSION_NAME="${{ matrix.version }}"
           BUILD_TIME=$(date +%Y%m%d_%H%M%S)
-          CURRENT_DATE=$(date +%Y.%m.%d)
-          
+
           cd output_dist
           tar -czvf "Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" boot.img rootfs_ufi001c.img
           mv "Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" ..
-          
+
           tar -czvf "Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" boot.img rootfs_ufi003.img
           mv "Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" ..
           cd ..
-          
+
           echo "UFI001C_ARCHIVE=Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz" >> $GITHUB_ENV
           echo "UFI003_ARCHIVE=Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz" >> $GITHUB_ENV
-          echo "TAG_NAME=Armbian_${VERSION_NAME}_${CURRENT_DATE}" >> $GITHUB_ENV
 
       - name: Upload Output to Release Tag
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "${{ env.TAG_NAME }}"
+          tag_name: "${{ needs.get-versions.outputs.tag_name }}"
           files: |
             ${{ env.UFI001C_ARCHIVE }}
             ${{ env.UFI003_ARCHIVE }}
