@@ -669,4 +669,29 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "${{ needs.get-versions.outputs.tag_name }}"
-          name: "MSM8916 Armbian ${{ needs.get-versio
+          name: "MSM8916 Armbian ${{ needs.get-versions.outputs.tag_name }} [${{ inputs.target_device }}]"
+          body: |
+            ## MSM8916 Armbian 固件
+
+            - **构建时间**: ${{ needs.get-versions.outputs.tag_name }}
+            - **目标设备**: ${{ inputs.target_device }}
+            - **Armbian 版本**: ${{ matrix.version }}
+            - **内核来源**: 本仓库 `kernel_stable` Release
+
+            ## 文件说明
+
+            | 文件 | 用途 |
+            |---|---|
+            | `boot.img` | 内核 + DTB + initrd，两款设备通用 |
+            | `rootfs_ufi001c.img` | UFI001C 根文件系统 |
+            | `rootfs_ufi003.img` | UFI003 根文件系统 |
+
+            ## 刷机后支持特性
+            - ✅ DAE (eBPF 透明代理)
+            - ✅ Docker 容器化
+
+          files: |
+            ${{ env.UFI001C_ARCHIVE }}
+            ${{ env.UFI003_ARCHIVE }}
+        env:
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
