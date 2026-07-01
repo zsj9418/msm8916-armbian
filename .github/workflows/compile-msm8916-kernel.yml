@@ -1,12 +1,3 @@
-#==========================================================================
-# Description: Compile msm8916 kernel for THWC UFI001C
-# Kernel source: https://github.com/Crychic-Band/kernel_ufi_msm8916
-# Kernel branch: msm8916/6.18
-# defconfig:  arch/arm64/configs/msm8916_defconfig
-# DAE requires: https://github.com/daeuniverse/dae/blob/main/docs/en/README.md
-# Docker requires: https://github.com/docker/docker/blob/master/contrib/check-config.sh
-#==========================================================================
-
 name: Compile msm8916 kernel
 
 on:
@@ -30,7 +21,6 @@ on:
 env:
   TZ: Etc/UTC
   KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
-  # ★ 明确指定包含 msm8916_defconfig 的分支
   KERNEL_BRANCH: msm8916/6.18
 
 jobs:
